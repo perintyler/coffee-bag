@@ -1,0 +1,5 @@
+packages: []
+# vitest's bundler. Without this, pnpm skips esbuild's postinstall and the
+# test suite cannot start.
+allowBuilds:
+  esbuild: true
