@@ -7,8 +7,8 @@
 # normally (the caffeinate assertion still holds, `pmset disablesleep` is never
 # touched). Run it only if you want the Mac to stay awake with the lid CLOSED.
 #
-#   bags/coffee/scripts/install-sudoers          # install
-#   bags/coffee/scripts/install-sudoers --remove # uninstall
+#   scripts/install-sudoers          # install
+#   scripts/install-sudoers --remove # uninstall
 #
 # Why root is needed at all: caffeinate cannot keep a Mac awake with the lid
 # shut. -d/-i create idle assertions, and lid-close is a FORCED sleep path, so
@@ -36,7 +36,7 @@ TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
 cat > "$TMP" <<EOF
-# Installed by the Barry coffee bag (bags/coffee/scripts/install-sudoers).
+# Installed by the Barry coffee bag (scripts/install-sudoers).
 #
 # Lets the coffee supervisor keep this Mac awake with the LID CLOSED, which
 # caffeinate cannot do on its own.
@@ -48,7 +48,7 @@ cat > "$TMP" <<EOF
 # its EXIT/TERM/INT trap, and a run-at-load reconciler clears an orphaned
 # setting at login if the daemon is SIGKILLed or the machine loses power.
 #
-# To remove: bags/coffee/scripts/install-sudoers --remove
+# To remove: scripts/install-sudoers --remove
 ${USER_NAME} ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0
 EOF
 
@@ -75,4 +75,4 @@ fi
 echo "installed and verified."
 echo
 echo "enable lid-closed operation with:"
-echo "  barry coffee lid-awake on"
+echo "  barry coffee lid-awake --on"
