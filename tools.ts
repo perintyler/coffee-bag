@@ -44,10 +44,26 @@ interface CoffeeStatus {
   power: PowerState;
   daemonLoaded: boolean;
   /** What the machine will actually do, once config and power are combined. */
-  effective: "asserting" | "waiting-for-ac" | "off" | "daemon-not-running";
+  effective:
+    | "asserting"
+    | "asserting-on-battery"
+    | "off"
+    | "daemon-not-running";
   configPath: string;
 }
 
+/**
+ * Mirrors the supervisor's gate. If these two ever disagree, `coffee status`
+ * describes a machine that does not exist — which is the one failure this bag
+ * is supposed to make impossible, so keep this in step with `power_state()`
+ * and the main loop in scripts/coffee-supervisor.
+ *
+ * Note there is no "waiting for AC" state any more: coffee holds on battery
+ * too, and the daemon only stands down when power is UNREADABLE. That case is
+ * deliberately not modelled here — readPowerState() collapses "battery" and
+ * "unreadable" into onAc:false, so status cannot tell them apart. It reports
+ * the common case (holding) rather than inventing certainty it does not have.
+ */
 function effectiveState(
   config: CoffeeConfig,
   power: PowerState,
@@ -55,7 +71,7 @@ function effectiveState(
 ): CoffeeStatus["effective"] {
   if (!config.enabled) return "off";
   if (!daemonLoaded) return "daemon-not-running";
-  return power.onAc ? "asserting" : "waiting-for-ac";
+  return power.onAc ? "asserting" : "asserting-on-battery";
 }
 
 function launchctl(args: string[]): void {
@@ -113,7 +129,7 @@ function formatStatus(s: CoffeeStatus): string {
 
   const headline: Record<CoffeeStatus["effective"], string> = {
     "asserting": "☕ ON — holding the display and system awake",
-    "waiting-for-ac": "🔋 ON, but standing down — on battery, will resume on AC",
+    "asserting-on-battery": "☕ ON — holding awake ⚠️  ON BATTERY, this is draining it",
     "off": "😴 OFF — the Mac sleeps normally",
     "daemon-not-running": "⚠️  ON in config, but the daemon is not loaded",
   };
@@ -190,8 +206,9 @@ export const coffeeOn = defineTool({
   access: "write",
   name: "on",
   description:
-    "Keep this Mac awake. Holds a display + system assertion, but only while on AC power — " +
-    "it stands down automatically on battery and resumes when plugged back in.",
+    "Keep this Mac awake. Holds a display + system assertion on AC and on battery alike — " +
+    "on battery it warns as the charge crosses 50/30/20/10/5%, but it never stands down. " +
+    "Closing the lid still sleeps the machine.",
   schema: {},
   handler: async () => {
     const started = ensureDaemonRunning();
@@ -205,9 +222,15 @@ export const coffeeOn = defineTool({
       return "⚠️  Enabled in config, but the daemon could not be started.\n"
         + "   Run `barry pack coffee` from ~/repos/barry to install its launchd job.";
     }
+    // On battery this is a warning, not a refusal. Coffee IS holding — say so
+    // first, then flag the cost. The previous wording led with the battery and
+    // read as though the command had declined to do anything.
     if (!r.power.onAc) {
-      return `🔋 Coffee is on, but you are on battery${r.power.percent === null ? "" : ` (${r.power.percent}%)`}.\n`
-        + "   Nothing is being held awake — it will start as soon as you plug in.";
+      const pct = r.power.percent === null ? "" : ` (${r.power.percent}%)`;
+      return `☕ Coffee is on — holding the Mac awake (within ${POLL_SECONDS}s).\n`
+        + `   ⚠️  On battery${pct} — this will drain it. You'll get an event at `
+        + "50/30/20/10/5%.\n"
+        + "   Closing the lid still sleeps. `barry coffee off` to stop.";
     }
     return `☕ Coffee is on — staying awake while on AC (within ${POLL_SECONDS}s).`;
   },
@@ -288,7 +311,8 @@ export const coffeeAutostart = defineTool({
   name: "autostart",
   description:
     "Control whether coffee turns itself on at login. With no argument, reports the current " +
-    "setting. Autostart still respects the AC gate — it never asserts on battery.",
+    "setting. Autostart holds on battery too, so a laptop that boots unplugged is kept awake " +
+    "until you turn coffee off.",
   schema: {
     state: z
       .enum(["on", "off"])

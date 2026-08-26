@@ -87,7 +87,7 @@ function makeStubDir(name: string, output: string): string {
   return dir;
 }
 
-describe.skipIf(!isMac)("coffee-supervisor: on_ac", () => {
+describe.skipIf(!isMac)("coffee-supervisor: power_state", () => {
   /**
    * REGRESSION: `pmset ... | grep -q "'AC Power'"` under `set -o pipefail`.
    *
@@ -109,18 +109,22 @@ describe.skipIf(!isMac)("coffee-supervisor: on_ac", () => {
       const out = withScriptFunctions(
         SUPERVISOR,
         `
-        fails=0
-        for i in $(seq 1 40); do on_ac || fails=$((fails+1)); done
-        echo "false_battery=$fails"
+        wrong=0
+        for i in $(seq 1 40); do [[ "$(power_state)" == "ac" ]] || wrong=$((wrong+1)); done
+        echo "not_ac=$wrong"
         `,
         {},
         { "/usr/bin/pmset": `${stub}/pmset` },
       );
-      expect(out).toContain("false_battery=0");
+      expect(out).toContain("not_ac=0");
     } finally {
       rmSync(stub, { recursive: true, force: true });
     }
-  });
+    // 40 iterations of `$(power_state)` — a command substitution per call,
+    // where the old boolean `on_ac` was a bare function call — lands at ~4.7s
+    // against vitest's 5s default. The iteration count is what catches the
+    // intermittent race, so raise the deadline rather than weaken the test.
+  }, 30_000);
 
   it("reports battery consistently across many calls", () => {
     const stub = makeStubDir(
@@ -131,21 +135,28 @@ describe.skipIf(!isMac)("coffee-supervisor: on_ac", () => {
       const out = withScriptFunctions(
         SUPERVISOR,
         `
-        acs=0
-        for i in $(seq 1 40); do on_ac && acs=$((acs+1)); done
-        echo "false_ac=$acs"
+        wrong=0
+        for i in $(seq 1 40); do [[ "$(power_state)" == "battery" ]] || wrong=$((wrong+1)); done
+        echo "not_battery=$wrong"
         `,
         {},
         { "/usr/bin/pmset": `${stub}/pmset` },
       );
-      expect(out).toContain("false_ac=0");
+      expect(out).toContain("not_battery=0");
     } finally {
       rmSync(stub, { recursive: true, force: true });
     }
-  });
+    // Same 40-iteration cost as the AC case above.
+  }, 30_000);
 
-  /** Invariant 4: unknown state must fall through to "not on AC". */
-  it("treats an unreadable pmset as battery, never as AC", () => {
+  /**
+   * Invariant 4. This is THE test protecting the new gate: coffee now holds on
+   * battery, so "unknown" is the only remaining reason to release. If unknown
+   * ever collapses back into "battery", a machine whose pmset is broken gets
+   * pinned awake indefinitely with no signal — the exact failure the bag is
+   * meant to surface.
+   */
+  it("reports an unreadable pmset as unknown, never as battery or ac", () => {
     const dir = mkdtempSync(join(tmpdir(), "coffee-stub-"));
     const bin = join(dir, "pmset");
     writeFileSync(bin, `#!/bin/bash\nexit 1\n`);
@@ -153,14 +164,139 @@ describe.skipIf(!isMac)("coffee-supervisor: on_ac", () => {
     try {
       const out = withScriptFunctions(
         SUPERVISOR,
-        `on_ac && echo "RESULT=ac" || echo "RESULT=battery"`,
+        `echo "RESULT=$(power_state)"`,
         {},
         { "/usr/bin/pmset": `${dir}/pmset` },
       );
-      expect(out).toContain("RESULT=battery");
+      expect(out).toContain("RESULT=unknown");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  /** Readable but unparseable is still a broken probe, not a power reading. */
+  it("reports unrecognised pmset output as unknown", () => {
+    const stub = makeStubDir("pmset", "some unexpected future format");
+    try {
+      const out = withScriptFunctions(
+        SUPERVISOR,
+        `echo "RESULT=$(power_state)"`,
+        {},
+        { "/usr/bin/pmset": `${stub}/pmset` },
+      );
+      expect(out).toContain("RESULT=unknown");
+    } finally {
+      rmSync(stub, { recursive: true, force: true });
+    }
+  });
+
+  /** Empty output must not read as a power source either. */
+  it("reports empty pmset output as unknown", () => {
+    const dir = mkdtempSync(join(tmpdir(), "coffee-stub-"));
+    const bin = join(dir, "pmset");
+    writeFileSync(bin, `#!/bin/bash\nexit 0\n`);
+    chmodSync(bin, 0o755);
+    try {
+      const out = withScriptFunctions(
+        SUPERVISOR,
+        `echo "RESULT=$(power_state)"`,
+        {},
+        { "/usr/bin/pmset": `${dir}/pmset` },
+      );
+      expect(out).toContain("RESULT=unknown");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.skipIf(!isMac)("coffee-supervisor: battery thresholds", () => {
+  /**
+   * Drives check_battery_thresholds directly with a scripted sequence of
+   * percentages, capturing which ones emitted. emit_event is stubbed to echo
+   * rather than shell out to the real CLI — these tests are about the dedupe
+   * and reset logic, not about Postgres.
+   */
+  function runThresholds(script: string): string {
+    const stub = makeStubDir("pmset", "Now drawing from 'Battery Power'");
+    try {
+      return withScriptFunctions(
+        SUPERVISOR,
+        `
+        emit_event() { echo "EMIT[$2] $1"; }
+        ${script}
+        `,
+        {},
+        { "/usr/bin/pmset": `${stub}/pmset` },
+      );
+    } finally {
+      rmSync(stub, { recursive: true, force: true });
+    }
+  }
+
+  it("says nothing above the highest threshold", () => {
+    const out = runThresholds(`
+      for p in 100 90 80 70 60 51; do check_battery_thresholds "$p"; done
+      echo "DONE"
+    `);
+    expect(out).not.toContain("EMIT");
+  });
+
+  it("emits once per threshold as the battery falls", () => {
+    const out = runThresholds(`
+      for p in 50 30 20 10 5; do check_battery_thresholds "$p"; done
+    `);
+    expect((out.match(/EMIT/g) ?? []).length).toBe(5);
+  });
+
+  /**
+   * The whole point of LAST_THRESHOLD. At a 15s poll a battery sits at 30%
+   * for many minutes, which without dedupe is an event every 15 seconds.
+   */
+  it("does not re-emit while sitting at the same level", () => {
+    const out = runThresholds(`
+      for i in $(seq 1 20); do check_battery_thresholds 30; done
+    `);
+    expect((out.match(/EMIT/g) ?? []).length).toBe(1);
+  });
+
+  /** A steep drop should report where the battery IS, not walk down the list. */
+  it("reports the lowest threshold crossed when several are skipped", () => {
+    const out = runThresholds(`check_battery_thresholds 4`);
+    expect((out.match(/EMIT/g) ?? []).length).toBe(1);
+    expect(out).toContain("battery 4%");
+  });
+
+  it("escalates severity to warn at and below 10%", () => {
+    const out = runThresholds(`
+      check_battery_thresholds 50
+      check_battery_thresholds 10
+    `);
+    expect(out).toContain("EMIT[info]");
+    expect(out).toContain("EMIT[warn]");
+  });
+
+  /**
+   * Reset-on-AC, verified through the real reset rather than by poking the
+   * variable: a discharge, a plug-in, then a second discharge must warn twice.
+   */
+  it("warns again after charging and draining a second time", () => {
+    const out = runThresholds(`
+      check_battery_thresholds 30
+      LAST_THRESHOLD=""   # what the ac branch of the main loop does
+      check_battery_thresholds 30
+    `);
+    expect((out.match(/EMIT/g) ?? []).length).toBe(2);
+  });
+
+  /**
+   * An unreadable percentage must not read as 0 and dump every warning at
+   * once — the same "unknown is not a reading" rule as power_state.
+   */
+  it("stays silent when the percentage cannot be read", () => {
+    const out = runThresholds(`check_battery_thresholds ""; echo "DONE"`);
+    expect(out).not.toContain("EMIT");
+    expect(out).toContain("DONE");
   });
 });
 
@@ -398,7 +534,12 @@ describe("power: caffeinate attribution", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-  });
+    // Explicit timeout: the helper lives 6s and readPowerState() shells out to
+    // `ps` once per caffeinate on the box, so vitest's 5s default is under the
+    // test's own floor. It passed alone and failed in a full run purely on
+    // ordering — a deadline that depends on how busy the machine is tells you
+    // nothing about the code under test.
+  }, 20_000);
 
   it("never claims a foreign caffeinate as ours", async () => {
     const { readPowerState } = await import("./power.js");

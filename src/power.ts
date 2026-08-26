@@ -71,15 +71,33 @@ export function readPowerState(): PowerState {
   // them, `coffee status` shows a pile of unexplained assertions and the one
   // question it exists to answer — "is COFFEE holding this?" — gets muddier
   // the busier the machine is.
+  // One `ps` for the whole process table, not three per caffeinate.
+  //
+  // The obvious shape here is pids.map(pid => ps(pid) + ps(ppid) + ps(...)),
+  // which is 3N forks. That reads fine on a quiet machine and falls over on a
+  // busy one: measured at 2.8s for 26 caffeinates, and `coffee status` calls
+  // this on every invocation. The cost scaled with UNRELATED processes, so the
+  // command got slower the more Claude sessions were open — the exact opposite
+  // of the "is coffee holding this?" question it exists to answer quickly.
+  const table = new Map<number, { ppid: number; command: string }>();
+  for (const line of run("/bin/ps", ["-Ao", "pid=,ppid=,command="]).split("\n")) {
+    // Command can contain spaces, so only split off the two leading numbers.
+    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (m) {
+      table.set(Number.parseInt(m[1], 10), {
+        ppid: Number.parseInt(m[2], 10),
+        command: m[3].trim(),
+      });
+    }
+  }
+
   const caffeinateOwners: CaffeinateOwner[] = pids.map((pid) => {
-    const args = run("/bin/ps", ["-o", "command=", "-p", String(pid)]).trim();
-    const ppid = Number.parseInt(
-      run("/bin/ps", ["-o", "ppid=", "-p", String(pid)]).trim(),
-      10,
-    );
-    const parentCmd = Number.isInteger(ppid)
-      ? run("/bin/ps", ["-o", "command=", "-p", String(ppid)]).trim()
-      : "";
+    const self = table.get(pid);
+    const args = self?.command ?? "";
+    // A process that exited between pgrep and ps leaves no parent to name;
+    // "unknown" is the honest answer, and describeOwner already says that.
+    const parentCmd =
+      self === undefined ? "" : table.get(self.ppid)?.command ?? "";
     const isOurs = parentCmd.includes("coffee-supervisor");
     return { pid, args, owner: describeOwner(parentCmd, isOurs), isOurs };
   });

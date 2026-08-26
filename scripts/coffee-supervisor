@@ -1,25 +1,36 @@
 #!/bin/bash
 #
 # coffee supervisor — owns exactly one `caffeinate` child, and only while the
-# machine is enabled AND on AC power.
+# machine is enabled and its power state is readable.
 #
 # SAFETY INVARIANTS. Do not relax these without re-reading the reasoning:
 #
 #   1. Never `caffeinate -s`. That asserts PreventSystemSleep, which blocks
 #      FORCED sleep paths including lid-close. `-d`/`-i` are *idle* assertions
 #      and are deliberately weaker: they let clamshell sleep happen, which is
-#      what stops a laptop cooking itself in a backpack.
+#      what stops a laptop cooking itself in a backpack. This matters MORE now
+#      that coffee holds on battery: shutting the lid is still a hard stop.
 #
 #   2. Never `caffeinate -u`. It turns the display ON, which is actively
 #      hostile from a background daemon at 3am.
 #
 #   3. `pmset` is read-only here EXCEPT the two literal disablesleep commands,
-#      which run only when lid-awake is enabled, only on AC, and are always
-#      reverted by the EXIT trap. They are the only sudo in this bag.
+#      which run only when lid-awake is enabled and are always reverted by the
+#      EXIT trap. They are the only sudo in this bag.
 #
-#   4. Every branch that is not "enabled AND on AC" must release. Unknown or
-#      unreadable state releases rather than holds — the failure mode of a
-#      power daemon should be a sleeping machine, not a flat battery.
+#   4. UNKNOWN power state releases. Coffee deliberately DOES hold on battery
+#      — that is the point of the bag and it is the user's call — but "I
+#      cannot read pmset" is not the same fact as "I am on battery", and only
+#      the first one is a bug. Collapsing them would let a broken probe pin the
+#      machine awake forever with nothing in the log to say why, which is the
+#      failure this bag exists to make visible. `power_state` keeps the two
+#      apart so this invariant can hold.
+#
+#   5. Because nothing stands coffee down on battery any more, the battery
+#      threshold events below are the ONLY warning a draining machine gets.
+#      They are load-bearing, not decoration. Emitting them is best-effort
+#      though: a failed `barry events emit` must never keep the Mac awake, so
+#      every call is `|| true`.
 #
 set -uo pipefail
 
@@ -32,9 +43,34 @@ POLL_INTERVAL="${COFFEE_POLL_INTERVAL:-15}"
 BARRY_DIR="${BARRY_HOME:-${HOME}/.barry}"
 CONFIG="${COFFEE_CONFIG:-${BARRY_DIR}/coffee.json}"
 
+# The repo checkout, which is a DIFFERENT path from BARRY_DIR (the data dir).
+# Only needed to find the .env holding BARRY_DATABASE_URL.
+BARRY_REPO="${BARRY_REPO:-${HOME}/repos/barry}"
+BARRY_BIN="${BARRY_BIN:-/opt/homebrew/bin/barry}"
+
+# Sourced at runtime rather than baked into the plist: a bag's launchd plist is
+# world-readable, so secrets must not live there. Guarded because a missing
+# .env is survivable — events stop being recorded, the machine still stays
+# awake, and that is the right way round.
+if [[ -f "${BARRY_REPO}/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "${BARRY_REPO}/.env" 2>/dev/null || true
+  set +a
+fi
+
+# Battery levels that get an event while coffee holds on battery, high to low.
+# Order matters: the loop below fires the lowest crossed threshold, so this
+# must stay descending.
+BATTERY_THRESHOLDS=(50 30 20 10 5)
+
 CHILD=""
 SLEEP_DISABLED=0
 LAST_STATE=""
+# The lowest threshold already announced this discharge, so a 15s poll does not
+# re-announce 30% four times a minute. Reset on AC — see the `ac` branch — so
+# the next unplug warns again from the top.
+LAST_THRESHOLD=""
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
@@ -58,6 +94,13 @@ cfg() {
   esac
 }
 
+# Prints exactly one of: ac | battery | unknown.
+#
+# Three-way rather than a boolean because invariant 4 turns on the difference
+# between "on battery" (hold — the user asked for this) and "pmset told us
+# nothing" (release — something is broken). A boolean would have to pick one
+# meaning for both, and either choice is wrong for the other case.
+#
 # Deliberately NOT `pmset ... | grep -q`. Under `set -o pipefail`, `grep -q`
 # exits at the first match and closes the pipe, so pmset takes SIGPIPE and the
 # pipeline reports failure — meaning "on battery". It is a race, so it fires
@@ -66,15 +109,93 @@ cfg() {
 # caffeinate every poll forever while plugged in.
 #
 # Capturing the output first removes the pipe, so pipefail stays on for the
-# failures that actually matter. An unreadable pmset yields an empty string,
-# which correctly falls through to "not on AC".
-on_ac() {
+# failures that actually matter.
+power_state() {
   local out
-  out="$(/usr/bin/pmset -g batt 2>/dev/null)"
+  if ! out="$(/usr/bin/pmset -g batt 2>/dev/null)" || [[ -z "$out" ]]; then
+    echo unknown
+    return 0
+  fi
   case "$out" in
-    *"'AC Power'"*) return 0 ;;
-    *) return 1 ;;
+    *"'AC Power'"*) echo ac ;;
+    *"'Battery Power'"*) echo battery ;;
+    # Readable but unrecognised. Treated as unknown rather than guessed at:
+    # an unparseable pmset is exactly the broken-probe case invariant 4 is
+    # about, and silently reading it as "battery" would hide that.
+    *) echo unknown ;;
   esac
+}
+
+# Prints the battery percentage, or empty if it cannot be read. Empty is not
+# 0 — the threshold check below must not treat "unreadable" as "critical" and
+# fire every warning at once.
+battery_percent() {
+  local out
+  out="$(/usr/bin/pmset -g batt 2>/dev/null)" || return 0
+  [[ "$out" =~ ([0-9]+)% ]] && echo "${BASH_REMATCH[1]}"
+  return 0
+}
+
+# Records a session-less event in the barry event feed.
+#
+# Uses the CLI rather than the HTTP API on purpose: the API requires
+# BARRY_SECRET even from localhost, and a bag's launchd plist is world-readable
+# (packages/bags rejects vault/keychain service env for exactly this reason).
+# The CLI talks to Postgres directly and needs only BARRY_DATABASE_URL, which
+# is sourced from the repo .env at runtime — the same trick scripts/jobs/lib.sh
+# uses for the other launchd bash daemons.
+#
+# Absolute path because launchd resolves argv[0] against its own minimal PATH,
+# where a bare `barry` fails with exit 78.
+emit_event() {
+  local title="$1" severity="${2:-info}"
+  "$BARRY_BIN" events emit "$title" \
+    --type system_alert --severity "$severity" \
+    --metadata '{"bag":"coffee","service":"daemon"}' >/dev/null 2>&1 || true
+}
+
+# Fires one event per threshold crossed while holding on battery.
+#
+# Announces the LOWEST crossed threshold, not the highest, so a machine that
+# sleeps through several marks (or a poll that lands after a steep drop) still
+# reports where the battery actually is rather than walking down the list one
+# poll at a time. LAST_THRESHOLD then suppresses everything at or above that
+# level until the next AC reset.
+# Explicit `if` blocks rather than `&&` chains throughout: a trailing `((...))`
+# that evaluates false returns 1, which would make this function look like it
+# failed on a perfectly normal poll.
+check_battery_thresholds() {
+  local pct="$1" t hit=""
+
+  # Unreadable percentage: say nothing. Guessing here would fire all five
+  # warnings at once the moment pmset hiccups.
+  if [[ -z "$pct" ]]; then
+    return 0
+  fi
+
+  for t in "${BATTERY_THRESHOLDS[@]}"; do
+    if (( pct <= t )); then
+      hit="$t"
+    fi
+  done
+
+  if [[ -z "$hit" ]]; then
+    return 0
+  fi
+
+  # Already announced this level or a lower one this discharge.
+  if [[ -n "$LAST_THRESHOLD" ]] && (( hit >= LAST_THRESHOLD )); then
+    return 0
+  fi
+
+  LAST_THRESHOLD="$hit"
+  log "battery ${pct}% — still holding (threshold ${hit}%)"
+  if (( hit <= 10 )); then
+    emit_event "⚠️ coffee still holding the Mac awake — battery ${pct}%" warn
+  else
+    emit_event "coffee is holding the Mac awake on battery — ${pct}%" info
+  fi
+  return 0
 }
 
 disable_sleep() {
@@ -147,19 +268,43 @@ fi
 log "supervisor started (poll ${POLL_INTERVAL}s, config ${CONFIG})"
 
 while true; do
-  if [[ "$(cfg enabled)" == "true" ]] && on_ac; then
-    state="on"
-    acquire
-  else
+  enabled="$(cfg enabled)"
+  power="$(power_state)"
+
+  if [[ "$enabled" != "true" ]]; then
     state="off"
     release
+  else
+    case "$power" in
+      ac)
+        state="on-ac"
+        acquire
+        # Plugging in ends the discharge, so the next unplug warns from the
+        # top again. Without this reset a machine that dipped to 5%, charged,
+        # and drained again would go entirely unwarned the second time.
+        LAST_THRESHOLD=""
+        ;;
+      battery)
+        state="on-battery"
+        acquire
+        check_battery_thresholds "$(battery_percent)"
+        ;;
+      *)
+        # Invariant 4. Not "on battery" — genuinely unreadable, which means a
+        # broken probe, so let the machine sleep rather than hold it awake
+        # blind.
+        state="unknown-power"
+        release
+        ;;
+    esac
   fi
 
   # Log transitions only. A line every 15s would bury the interesting events.
   if [[ "$state" != "$LAST_STATE" ]]; then
-    if [[ "$state" == "off" && "$(cfg enabled)" == "true" ]]; then
-      log "on battery — standing down until AC returns"
-    fi
+    case "$state" in
+      on-battery) log "on battery — holding anyway (events at ${BATTERY_THRESHOLDS[*]}%)" ;;
+      unknown-power) log "WARNING power state unreadable — releasing (see invariant 4)" ;;
+    esac
     LAST_STATE="$state"
   fi
 
