@@ -8,7 +8,7 @@ importers:
 
   .:
     dependencies:
-      '@barry/tools':
+      '@barry-rocks/tools':
         specifier: link:../../barry/packages/tools
         version: link:../../barry/packages/tools
       zod:

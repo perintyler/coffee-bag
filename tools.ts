@@ -1,4 +1,4 @@
-import { defineTool } from "@barry/tools";
+import { defineTool } from "@barry-rocks/tools";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
