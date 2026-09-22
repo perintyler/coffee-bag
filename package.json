@@ -7,7 +7,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@barry-rocks/tools": "link:../../barry/packages/tools",
+    "@barry-rocks/sdk-bags": "link:../../barry/sdk/bags",
     "zod": "3.25.76"
   },
   "devDependencies": {

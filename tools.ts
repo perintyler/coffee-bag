@@ -1,4 +1,4 @@
-import { defineTool } from "@barry-rocks/tools";
+import { defineTool } from "@barry-rocks/sdk-bags";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
