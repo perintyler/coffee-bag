@@ -42,7 +42,7 @@ bash loop, and its three obligations are:
 
 - **Never stack.** Acquire is idempotent.
 - **Always release.** Disabled, or an unreadable power state, releases within a
-  poll, and a trap covers EXIT/TERM/INT — so `launchctl bootout` cannot orphan
+  poll, and a trap covers EXIT/TERM/INT — so stopping the service cannot orphan
   anything.
 - **Fail toward sleep.** Unreadable state reads as off, never as "on battery".
   A power daemon that cannot tell where its power comes from should let the
@@ -52,7 +52,7 @@ bash loop, and its three obligations are:
   They are load-bearing. Emitting them is best-effort though — a failed
   `barry events emit` must never keep the Mac awake.
 
-Config lives in `~/.barry/coffee.json` (`enabled`, `autostart`, `lidAwake`).
+Config lives in `coffee.json` in the bag's data directory (`enabled`, `autostart`, `lidAwake`).
 
 **Autostart is config, not a plist property.** The daemon deliberately has no
 `RunAtLoad`; the supervisor reads `autostart` at startup and seeds `enabled`
@@ -85,7 +85,7 @@ holds, and both `lid-awake` and `status` say so rather than failing quietly.
 Residual risk after all that: a hard kill while asserting leaves sleep disabled
 until you next log in.
 
-Kill switches, escalating: `barry coffee off` → `launchctl bootout …` (fires the
+Kill switches, escalating: `barry coffee off` → `barry service stop coffee.daemon` (fires the
 trap) → `kill <pid>` → `sudo pmset -a disablesleep 0`.
 
 ## Reading `status`

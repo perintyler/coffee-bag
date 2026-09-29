@@ -54,7 +54,7 @@ function withScriptFunctions(
     );
     return execFileSync("/bin/bash", [harness], {
       encoding: "utf8",
-      env: { ...process.env, ...env, HOME: dir, BARRY_HOME: dir },
+      env: { ...process.env, ...env, HOME: dir, BARRY_HOME: dir, BARRY_BAG_DATA_DIR: dir },
       timeout: 30_000,
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
@@ -348,7 +348,7 @@ describe.skipIf(!isMac)("coffee-reconcile: sleep_disabled", () => {
     );
     try {
       const src = execFileSync("/bin/cat", [RECONCILE], { encoding: "utf8" });
-      const prelude = src.split(/^if ! sleep_disabled; then$/m)[0];
+      const prelude = src.split(/^status=0$/m)[0];
       const dir = mkdtempSync(join(tmpdir(), "coffee-sh-"));
       const harness = join(dir, "h.sh");
       // The script calls ioreg by absolute path (hardening), so PATH alone
@@ -417,14 +417,21 @@ describe.skipIf(!isMac)("coffee scripts: safety invariants", () => {
     expect(src).not.toMatch(/pmset\s+-a\s+(?!disablesleep)/);
   });
 
-  /** The trap is what makes `launchctl bootout` unable to orphan anything. */
+  /** The trap is what makes a supervisor stop unable to orphan anything. */
   it("traps EXIT, TERM and INT so no exit path strands an assertion", () => {
     expect(code(SUPERVISOR)).toMatch(/trap\s+'[^']*release[^']*'\s+EXIT\s+TERM\s+INT/);
   });
 
-  /** Guards the divergence that made the CLI and daemon read different files. */
-  it("resolves its config path the same way defaultConfigPath() does", () => {
-    expect(code(SUPERVISOR)).toContain('BARRY_DIR="${BARRY_HOME:-${HOME}/.barry}"');
+  /**
+   * Guards the divergence that made the CLI and daemon read different files:
+   * both resolve coffee.json in the bag's data directory, which the supervisor
+   * passes the daemon as BARRY_BAG_DATA_DIR.
+   */
+  it("resolves its config path the same way defaultConfigPath() does", async () => {
+    expect(code(SUPERVISOR)).toContain('CONFIG="${COFFEE_CONFIG:-${BARRY_BAG_DATA_DIR}/coffee.json}"');
+    const { defaultConfigPath } = await import("./config.js");
+    const { bagDataDir } = await import("@barry-rocks/sdk/services/home");
+    expect(defaultConfigPath()).toBe(join(bagDataDir("coffee"), "coffee.json"));
   });
 });
 
@@ -447,7 +454,7 @@ describe("coffee-supervisor: autostart seeding", () => {
       writeFileSync(harness, prelude);
       const out = execFileSync("/bin/bash", [harness], {
         encoding: "utf8",
-        env: { ...process.env, COFFEE_CONFIG: cfgPath },
+        env: { ...process.env, COFFEE_CONFIG: cfgPath, BARRY_BAG_DATA_DIR: dir },
         timeout: 30_000,
         stdio: ["ignore", "pipe", "ignore"],
       });

@@ -1,5 +1,4 @@
 import { defineTool } from "@barry-rocks/sdk/bags";
-import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,9 +9,11 @@ import {
   updateConfig,
   type CoffeeConfig,
 } from "./src/config.js";
-import { readPowerState, isServiceLoaded, type PowerState } from "./src/power.js";
+import { readPowerState, type PowerState } from "./src/power.js";
+import { supervisorRequest } from "@barry-rocks/sdk/supervisor";
 
-const DAEMON_LABEL = "com.barry.bag.coffee.daemon";
+/** The daemon, by its registry name: the instance's supervisor runs it. */
+const DAEMON = "coffee.daemon";
 
 /**
  * The sudoers rule that `lid-awake` needs. Its absence is not an error — the
@@ -74,47 +75,43 @@ function effectiveState(
   return power.onAc ? "asserting" : "asserting-on-battery";
 }
 
-function launchctl(args: string[]): void {
-  execFileSync("/bin/launchctl", args, { stdio: "pipe", timeout: 10_000 });
-}
-
-function domain(): string {
-  return `gui/${process.getuid?.() ?? 501}`;
-}
-
-/**
- * Brings the daemon up if it is not already loaded.
- *
- * The plist deliberately has no RunAtLoad, so `coffee on` after a fresh login
- * would otherwise flip a config flag that nothing is reading. Bootstrapping
- * here is what makes the toggle mean something.
- */
-function ensureDaemonRunning(): boolean {
-  if (isServiceLoaded(DAEMON_LABEL)) return true;
-  const plist = `${process.env.HOME}/Library/LaunchAgents/${DAEMON_LABEL}.plist`;
+/** Whether the supervisor has the daemon running. Unknown (no supervisor) reads as not running. */
+async function isDaemonRunning(): Promise<boolean> {
   try {
-    launchctl(["bootstrap", domain(), plist]);
-    return true;
+    const { services } = await supervisorRequest({ op: "status" });
+    return services.some((s) => s.key === DAEMON && s.state === "running");
   } catch {
-    // Not fatal — report it in status rather than failing the toggle. The most
-    // likely cause is that `barry pack coffee` has not been run yet.
     return false;
   }
 }
 
-function stopDaemon(): void {
+/**
+ * Brings the daemon up if it is not already running. It is a manual service,
+ * so `coffee on` would otherwise flip a config flag that nothing is reading.
+ */
+async function ensureDaemonRunning(): Promise<boolean> {
+  if (await isDaemonRunning()) return true;
   try {
-    launchctl(["bootout", `${domain()}/${DAEMON_LABEL}`]);
+    await supervisorRequest({ op: "start", service: DAEMON }, { timeoutMs: 30_000 });
+    return true;
   } catch {
-    // Already stopped. `bootout` on an unloaded job is an error we do not care
-    // about — the desired end state is the same either way.
+    // Not fatal — report it in status rather than failing the toggle.
+    return false;
   }
 }
 
-function buildStatus(): CoffeeStatus {
+async function stopDaemon(): Promise<void> {
+  try {
+    await supervisorRequest({ op: "stop", service: DAEMON }, { timeoutMs: 30_000 });
+  } catch {
+    // Already stopped, or no supervisor: the desired end state either way.
+  }
+}
+
+async function buildStatus(): Promise<CoffeeStatus> {
   const config = readConfig();
   const power = readPowerState();
-  const daemonLoaded = isServiceLoaded(DAEMON_LABEL);
+  const daemonLoaded = await isDaemonRunning();
   return {
     config,
     power,
@@ -142,7 +139,7 @@ function formatStatus(s: CoffeeStatus): string {
   if (s.power.lidClosed !== null) {
     lines.push(`  lid         ${s.power.lidClosed ? "closed" : "open"}`);
   }
-  lines.push(`  daemon      ${s.daemonLoaded ? "loaded" : "not loaded"}`);
+  lines.push(`  daemon      ${s.daemonLoaded ? "running" : "not running"}`);
   lines.push("");
   lines.push(`  enabled     ${s.config.enabled}`);
   lines.push(`  autostart   ${s.config.autostart}`);
@@ -211,7 +208,7 @@ export const coffeeOn = defineTool({
     "Closing the lid still sleeps the machine.",
   schema: {},
   handler: async () => {
-    const started = ensureDaemonRunning();
+    const started = await ensureDaemonRunning();
     const config = updateConfig({ enabled: true });
     const power = readPowerState();
     return { config, power, daemonLoaded: started, configPath: defaultConfigPath() };
@@ -220,7 +217,7 @@ export const coffeeOn = defineTool({
     const r = result as { config: CoffeeConfig; power: PowerState; daemonLoaded: boolean };
     if (!r.daemonLoaded) {
       return "⚠️  Enabled in config, but the daemon could not be started.\n"
-        + "   Run `barry pack coffee` from ~/repos/barry to install its launchd job.";
+        + "   Is `barry up` running? `barry service start coffee.daemon` says why.";
     }
     // On battery this is a warning, not a refusal. Coffee IS holding — say so
     // first, then flag the cost. The previous wording led with the battery and
@@ -251,7 +248,7 @@ export const coffeeOff = defineTool({
     const config = updateConfig({ enabled: false });
     // Stopping the daemon fires its EXIT trap, which releases the assertion
     // and restores sleep — so --now is a clean shutdown, not a kill.
-    if (now) stopDaemon();
+    if (now) await stopDaemon();
     return { config, stopped: Boolean(now), power: readPowerState() };
   },
   cliFormat: (result) => {
@@ -330,7 +327,7 @@ export const coffeeAutostart = defineTool({
     const autostart = want;
     const config = updateConfig({ autostart });
     // Autostart is only meaningful if the job exists to be started at login.
-    if (autostart) ensureDaemonRunning();
+    if (autostart) await ensureDaemonRunning();
     return { config, changed: true };
   },
   cliFormat: (result) => {

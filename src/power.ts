@@ -32,9 +32,8 @@ export interface CaffeinateOwner {
 function run(cmd: string, args: string[]): string {
   try {
     // stderr is explicitly discarded rather than inherited. A probe failing is
-    // a normal, expected state here — `launchctl print` on an unloaded job
-    // prints "Could not find service ... in domain for user" — and that is
-    // reported as "daemon: not loaded", not dumped raw above the status table.
+    // a normal, expected state here, reported in the status table rather than
+    // dumped raw above it.
     return execFileSync(cmd, args, {
       encoding: "utf8",
       timeout: 5000,
@@ -116,12 +115,6 @@ export function readPowerState(): PowerState {
     caffeinateOwners,
     assertions,
   };
-}
-
-/** True when the launchd job for a bag service is currently loaded. */
-export function isServiceLoaded(label: string): boolean {
-  const out = run("/bin/launchctl", ["print", `gui/${process.getuid?.() ?? 501}/${label}`]);
-  return out.length > 0;
 }
 
 /** Turns a parent command line into something short enough for a status line. */
