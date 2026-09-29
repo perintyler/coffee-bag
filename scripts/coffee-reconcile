@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# coffee reconcile — runs once at login, then exits.
+# coffee reconcile — runs once at login (an `at: login` schedule), then exits.
 #
 # The supervisor's EXIT trap restores `pmset disablesleep 0` on every clean
 # shutdown path. It cannot cover SIGKILL, a panic, or a hard power loss. In
@@ -30,14 +30,28 @@ sleep_disabled() {
   esac
 }
 
-if ! sleep_disabled; then
-  exit 0
+status=0
+if sleep_disabled; then
+  log "found SleepDisabled=Yes at login — clearing orphaned disablesleep"
+  if sudo -n /usr/bin/pmset -a disablesleep 0 2>/dev/null; then
+    log "sleep restored"
+  else
+    log "ERROR could not restore sleep — run: sudo pmset -a disablesleep 0"
+    status=1
+  fi
 fi
 
-log "found SleepDisabled=Yes at login — clearing orphaned disablesleep"
-if sudo -n /usr/bin/pmset -a disablesleep 0 2>/dev/null; then
-  log "sleep restored"
-else
-  log "ERROR could not restore sleep — run: sudo pmset -a disablesleep 0"
-  exit 1
+# `autostart` means coffee turns itself on at login. The daemon is a manual
+# service, so this login run is what starts it; the daemon itself then seeds
+# `enabled` from `autostart`.
+CONFIG="${COFFEE_CONFIG:-${BARRY_BAG_DATA_DIR:-}/coffee.json}"
+if [[ -n "${BARRY_BAG_DATA_DIR:-}" ]] \
+  && [[ "$(/usr/bin/plutil -extract autostart raw -o - -- "$CONFIG" 2>/dev/null)" == "true" ]]; then
+  if "${BARRY_BIN:-barry}" service start coffee.daemon >/dev/null 2>&1; then
+    log "autostart on — started coffee.daemon"
+  else
+    log "ERROR autostart on, but coffee.daemon would not start: barry service start coffee.daemon"
+    status=1
+  fi
 fi
+exit "$status"

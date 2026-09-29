@@ -1,3 +1,4 @@
+import { bagDataDir } from "@barry-rocks/sdk/services/home";
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -40,9 +41,9 @@ export function defaultConfig(): CoffeeConfig {
   return { version: 1, enabled: false, autostart: false, lidAwake: false };
 }
 
+/** `coffee.json` in the bag's data directory; the daemon reads the same file (BARRY_BAG_DATA_DIR). */
 export function defaultConfigPath(): string {
-  const home = process.env.BARRY_HOME ?? join(process.env.HOME ?? "", ".barry");
-  return join(home, "coffee.json");
+  return join(bagDataDir("coffee"), "coffee.json");
 }
 
 function asBool(value: unknown, fallback: boolean): boolean {
